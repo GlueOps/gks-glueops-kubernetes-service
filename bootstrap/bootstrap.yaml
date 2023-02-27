@@ -1,0 +1,217 @@
+---
+- name: Upgrade packages
+  hosts: all
+  become: true
+  tasks:
+    - name: Set hostname to FQDN
+      hostname:
+        name: "private-{{ inventory_hostname }}"
+
+    - name: Get latest updates
+      become: yes
+      shell: apt update
+      register: ps
+    - debug: var=ps.stdout_lines
+
+    - name: List Updates
+      become: yes
+      shell: apt list --upgradable
+      register: ps
+    - debug: var=ps.stdout_lines
+
+    - name: Install security updates
+      become: yes
+      shell: apt list --upgradable | grep '-security' | awk -F'/' '{ print $1 }' | xargs apt install -y
+      register: ps
+    - debug: var=ps.stdout_lines
+
+    - name: Clean package repo
+      become: yes
+      shell: apt clean -y
+      register: ps
+    - debug: var=ps.stdout_lines
+
+    - name: Download containerd release
+      get_url:
+        url: "https://github.com/containerd/containerd/releases/download/v1.6.18/containerd-1.6.18-linux-amd64.tar.gz"
+        dest: "/tmp/containerd-1.6.18-linux-amd64.tar.gz"
+
+    - name: Extract containerd release
+      unarchive:
+        src: "/tmp/containerd-1.6.18-linux-amd64.tar.gz"
+        dest: "/usr/local"
+        remote_src: yes
+
+    - name: Download containerd service file
+      get_url:
+        url: "https://raw.githubusercontent.com/containerd/containerd/v1.6.18/containerd.service"
+        dest: "/usr/lib/systemd/system/containerd.service"
+
+    - name: Reload systemd units
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start containerd service
+      systemd:
+        name: containerd
+        enabled: yes
+        state: started
+
+    - name: Download runc binary
+      get_url:
+        url: "https://github.com/opencontainers/runc/releases/download/v1.1.4/runc.amd64"
+        dest: "/usr/local/sbin/runc"
+        mode: "0755"
+
+    - name: Download CNI plugins
+      get_url:
+        url: "https://github.com/containernetworking/plugins/releases/download/v1.2.0/cni-plugins-linux-amd64-v1.2.0.tgz"
+        dest: "/tmp/cni-plugins-linux-amd64-v1.2.0.tgz"
+
+    - name: Create destination directory if it does not exist
+      file:
+        path: "/opt/cni/bin"
+        state: directory
+
+    - name: Extract archive
+      unarchive:
+        src: "/tmp/cni-plugins-linux-amd64-v1.2.0.tgz"
+        dest: "/opt/cni/bin"
+        remote_src: yes
+
+    - name: Create destination directory if it does not exist
+      file:
+        path: "/etc/containerd"
+        state: directory
+
+    - name: Create containerd configuration file
+      copy:
+        src: ./files/etc/containerd/config.toml
+        dest: /etc/containerd/config.toml
+
+    - name: Reload systemd units
+      systemd:
+        daemon_reload: yes
+
+    - name: Ensure containerd service is running
+      systemd:
+        name: containerd
+        state: started
+        enabled: yes
+
+    - name: Disable swap for current session
+      command: swapoff -a
+      become: true
+
+    - name: Disable swap permanently, persist reboots
+      replace:
+        path: /etc/fstab
+        regexp: '^(\s*)([^#\n]+\s+)(\w+\s+)swap(\s+.*)$'
+        replace: '#\1\2\3swap\4'
+        backup: yes
+
+    - name: Install apt-transport-https
+      become: yes
+      apt:
+        name: apt-transport-https=2.2.4 # these are already installed for debian: ca-certificates curl
+        state: present
+
+    - name: Create destination directory '/etc/apt/keyrings' if it does not exist
+      file:
+        path: "/etc/apt/keyrings"
+        state: directory
+
+    - name: Download Kubernetes archive keyring
+      get_url:
+        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+        dest: /etc/apt/keyrings/kubernetes-archive-keyring.gpg
+        mode: "0644"
+
+    - name: Add Kubernetes apt repository
+      apt_repository:
+        filename: kubernetes
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main"
+
+    ## https://stackoverflow.com/questions/49721708/how-to-install-specific-version-of-kubernetes
+    ## curl -s https://packages.cloud.google.com/apt/dists/kubernetes-xenial/main/binary-amd64/Packages | grep Version | awk '{print $2}' | grep 1.26
+    - name: Install Kubernetes packages
+      apt:
+        name: "{{ item }}=1.26.1-00"
+        state: present
+        update_cache: yes
+      with_items:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: Hold Kubernetes packages
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      with_items:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: Forwarding IPv4 and letting iptables see bridged traffic Part 1 of 2
+      copy:
+        src: ./files/etc/modules-load.d/k8s.conf
+        dest: /etc/modules-load.d/k8s.conf
+
+    - name: sudo modprobe overlay
+      become: yes
+      shell: sudo modprobe overlay
+      register: ps
+    - debug: var=ps.stdout_lines
+
+    - name: sudo modprobe br_netfilter
+      become: yes
+      shell: sudo modprobe br_netfilter
+      register: ps
+    - debug: var=ps.stdout_lines
+
+    - name: Forwarding IPv4 and letting iptables see bridged traffic Part 2 of 2
+      copy:
+        src: ./files/etc/sysctl.d/k8s.conf
+        dest: /etc/sysctl.d/k8s.conf
+
+    - name: Reload sysctl
+      become: yes
+      shell: sysctl --system
+      register: ps
+    - debug: var=ps.stdout_lines
+
+    - name: Clean package repo
+      become: yes
+      shell: apt clean -y
+      register: ps
+    - debug: var=ps.stdout_lines
+
+    - name: Check br_netfilter
+      become: yes
+      shell: lsmod | grep br_netfilter
+      register: ps
+    - debug: var=ps.stdout_lines
+
+    - name: Check overlay
+      become: yes
+      shell: lsmod | grep overlay
+      register: ps
+    - debug: var=ps.stdout_lines
+
+    - name: Check that the net.bridge.bridge-nf-call-iptables, net.bridge.bridge-nf-call-ip6tables, net.ipv4.ip_forward system variables are set to 1
+      become: yes
+      shell: sysctl net.bridge.bridge-nf-call-iptables net.bridge.bridge-nf-call-ip6tables net.ipv4.ip_forward
+      register: ps
+    - debug: var=ps.stdout_lines
+
+    - name: Reboot the machine
+      reboot:
+        reboot_timeout: 1800
+        post_reboot_delay: 60
+
+    - name: Check system is online again
+      become: yes
+      shell: whoami
+      register: ps
+    - debug: var=ps.stdout_lines
